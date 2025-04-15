@@ -84,9 +84,9 @@ var htmx = (function() {
       /**
        * The number of pages to keep in **localStorage** for history support.
        * @type number
-       * @default 10
+       * @default 20
        */
-      historyCacheSize: 10,
+      historyCacheSize: 20,
       /**
        * @type boolean
        * @default false
@@ -3066,55 +3066,77 @@ var htmx = (function() {
   }
 
   /**
+   * @returns {Promise<IDBDatabase>}
+   */
+  function openHistoryDB() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open('htmx-history-cache', 1)
+      
+      request.onerror = () => reject(request.error)
+      
+      request.onsuccess = () => resolve(request.result)
+      
+      request.onupgradeneeded = (event) => {
+        const db = event.target.result
+        if (!db.objectStoreNames.contains('history')) {
+          db.createObjectStore('history', { keyPath: 'url' })
+        }
+      }
+    })
+  }
+
+  /**
    * @param {string} url
    * @param {Element} rootElt
    */
   function saveToHistoryCache(url, rootElt) {
-    if (!canAccessLocalStorage()) {
-      return
-    }
-
-    // get state to save
-    const innerHTML = cleanInnerHtmlForHistory(rootElt)
-    const title = getDocument().title
-    const scroll = window.scrollY
-
     if (htmx.config.historyCacheSize <= 0) {
-      // make sure that an eventually already existing cache is purged
-      localStorage.removeItem('htmx-history-cache')
       return
     }
 
     url = normalizePath(url)
 
-    const historyCache = parseJSON(localStorage.getItem('htmx-history-cache')) || []
-    for (let i = 0; i < historyCache.length; i++) {
-      if (historyCache[i].url === url) {
-        historyCache.splice(i, 1)
-        break
-      }
-    }
+    const innerHTML = cleanInnerHtmlForHistory(rootElt)
+    const title = getDocument().title
+    const scroll = window.scrollY
 
     /** @type HtmxHistoryItem */
     const newHistoryItem = { url, content: innerHTML, title, scroll }
 
-    triggerEvent(getDocument().body, 'htmx:historyItemCreated', { item: newHistoryItem, cache: historyCache })
+    openHistoryDB().then(db => {
+      const tx = db.transaction('history', 'readwrite')
+      const store = tx.objectStore('history')
 
-    historyCache.push(newHistoryItem)
-    while (historyCache.length > htmx.config.historyCacheSize) {
-      historyCache.shift()
-    }
+      // Get all records to manage cache size
+      const getAllRequest = store.getAll()
+      
+      getAllRequest.onsuccess = () => {
+        const historyCache = getAllRequest.result || []
+        
+        // Remove existing entry with same URL if exists
+        const existingIndex = historyCache.findIndex(item => item.url === url)
+        if (existingIndex > -1) {
+          historyCache.splice(existingIndex, 1)
+        }
 
-    // keep trying to save the cache until it succeeds or is empty
-    while (historyCache.length > 0) {
-      try {
-        localStorage.setItem('htmx-history-cache', JSON.stringify(historyCache))
-        break
-      } catch (e) {
-        triggerErrorEvent(getDocument().body, 'htmx:historyCacheError', { cause: e, cache: historyCache })
-        historyCache.shift() // shrink the cache and retry
+        triggerEvent(getDocument().body, 'htmx:historyItemCreated', { item: newHistoryItem, cache: historyCache })
+
+        historyCache.push(newHistoryItem)
+
+        // Remove oldest entries if cache is too large
+        while (historyCache.length > htmx.config.historyCacheSize) {
+          const oldestItem = historyCache.shift()
+          if (oldestItem) {
+            store.delete(oldestItem.url)
+          }
+        }
+
+        // Store the new item
+        store.put(newHistoryItem)
       }
-    }
+    }).catch(e => {
+      triggerErrorEvent(getDocument().body, 'htmx:historyCacheError', { cause: e })
+    })
   }
 
   /**
@@ -3127,22 +3149,63 @@ var htmx = (function() {
 
   /**
    * @param {string} url
-   * @returns {HtmxHistoryItem|null}
+   * @returns {Promise<HtmxHistoryItem|null>}
    */
   function getCachedHistory(url) {
-    if (!canAccessLocalStorage()) {
-      return null
-    }
-
     url = normalizePath(url)
+    
+    return openHistoryDB()
+      .then(db => {
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction('history', 'readonly')
+          const store = tx.objectStore('history')
+          const request = store.get(url)
+          
+          request.onsuccess = () => resolve(request.result || null)
+          request.onerror = () => reject(request.error)
+        })
+      })
+      .catch(() => null)
+  }
 
-    const historyCache = parseJSON(localStorage.getItem('htmx-history-cache')) || []
-    for (let i = 0; i < historyCache.length; i++) {
-      if (historyCache[i].url === url) {
-        return historyCache[i]
+  /**
+   * @param {string} [path]
+   */
+  async function restoreHistory(path) {
+    saveCurrentPageToHistory()
+    path = path || location.pathname + location.search
+    
+    try {
+      const cached = await getCachedHistory(path)
+      if (cached) {
+        const fragment = makeFragment(cached.content)
+        const historyElement = getHistoryElement()
+        const settleInfo = makeSettleInfo(historyElement)
+        handleTitle(cached.title)
+        handlePreservedElements(fragment)
+        swapInnerHTML(historyElement, fragment, settleInfo)
+        restorePreservedElements()
+        settleImmediately(settleInfo.tasks)
+        getWindow().setTimeout(function() {
+          window.scrollTo(0, cached.scroll)
+        }, 0)
+        currentPathForHistory = path
+        triggerEvent(getDocument().body, 'htmx:historyRestore', { path, item: cached })
+      } else {
+        if (htmx.config.refreshOnHistoryMiss) {
+          window.location.reload(true)
+        } else {
+          loadHistoryFromServer(path)
+        }
+      }
+    } catch (e) {
+      triggerErrorEvent(getDocument().body, 'htmx:historyCacheError', { cause: e })
+      if (htmx.config.refreshOnHistoryMiss) {
+        window.location.reload(true)
+      } else {
+        loadHistoryFromServer(path)
       }
     }
-    return null
   }
 
   /**
@@ -3252,38 +3315,6 @@ var htmx = (function() {
       }
     }
     request.send()
-  }
-
-  /**
-   * @param {string} [path]
-   */
-  function restoreHistory(path) {
-    saveCurrentPageToHistory()
-    path = path || location.pathname + location.search
-    const cached = getCachedHistory(path)
-    if (cached) {
-      const fragment = makeFragment(cached.content)
-      const historyElement = getHistoryElement()
-      const settleInfo = makeSettleInfo(historyElement)
-      handleTitle(cached.title)
-      handlePreservedElements(fragment)
-      swapInnerHTML(historyElement, fragment, settleInfo)
-      restorePreservedElements()
-      settleImmediately(settleInfo.tasks)
-      getWindow().setTimeout(function() {
-        window.scrollTo(0, cached.scroll)
-      }, 0) // next 'tick', so browser has time to render layout
-      currentPathForHistory = path
-      triggerEvent(getDocument().body, 'htmx:historyRestore', { path, item: cached })
-    } else {
-      if (htmx.config.refreshOnHistoryMiss) {
-        // @ts-ignore: optional parameter in reload() function throws error
-        // noinspection JSUnresolvedReference
-        window.location.reload(true)
-      } else {
-        loadHistoryFromServer(path)
-      }
-    }
   }
 
   /**
