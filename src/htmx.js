@@ -253,7 +253,7 @@ var htmx = (function() {
       scrollIntoViewOnBoost: true,
       /**
        * The cache to store evaluated trigger specifications into.
-       * You may define a simple object to use a never-clearing cache, or implement your own system using a [proxy object](https://developer.mozilla.org/docs/Web/JavaScript/Reference/Global_Objects/Proxy)
+       * You may define a simple object to use a never-clearing cache, or implement your own system using a [proxy object](https://developer.mozilla.org/docs/#config)
        * @type {Object|null}
        * @default null
        */
@@ -3104,37 +3104,90 @@ var htmx = (function() {
     const newHistoryItem = { url, content: innerHTML, title, scroll }
 
     openHistoryDB().then(db => {
-      const tx = db.transaction('history', 'readwrite')
-      const store = tx.objectStore('history')
-
-      // Get all records to manage cache size
-      const getAllRequest = store.getAll()
+      triggerEvent(getDocument().body, 'htmx:historyCache', { type: 'save-started', url })
       
-      getAllRequest.onsuccess = () => {
-        const historyCache = getAllRequest.result || []
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('history', 'readwrite')
+        const store = tx.objectStore('history')
+
+        // Get all records to manage cache size
+        const getAllRequest = store.getAll()
         
-        // Remove existing entry with same URL if exists
-        const existingIndex = historyCache.findIndex(item => item.url === url)
-        if (existingIndex > -1) {
-          historyCache.splice(existingIndex, 1)
-        }
+        getAllRequest.onsuccess = () => {
+          const historyCache = getAllRequest.result || []
+          
+          // Remove existing entry with same URL if exists
+          const existingIndex = historyCache.findIndex(item => item.url === url)
+          if (existingIndex > -1) {
+            historyCache.splice(existingIndex, 1)
+          }
 
-        triggerEvent(getDocument().body, 'htmx:historyItemCreated', { item: newHistoryItem, cache: historyCache })
+          triggerEvent(getDocument().body, 'htmx:historyItemCreated', { item: newHistoryItem, cache: historyCache })
 
-        historyCache.push(newHistoryItem)
+          historyCache.push(newHistoryItem)
 
-        // Remove oldest entries if cache is too large
-        while (historyCache.length > htmx.config.historyCacheSize) {
-          const oldestItem = historyCache.shift()
-          if (oldestItem) {
-            store.delete(oldestItem.url)
+          // Remove oldest entries if cache is too large
+          while (historyCache.length > htmx.config.historyCacheSize) {
+            const oldestItem = historyCache.shift()
+            if (oldestItem) {
+              store.delete(oldestItem.url)
+            }
+          }
+
+          // Store the new item
+          const putRequest = store.put(newHistoryItem)
+          
+          putRequest.onsuccess = () => {
+            triggerEvent(getDocument().body, 'htmx:historyCache', { 
+              type: 'save-success', 
+              url,
+              item: newHistoryItem 
+            })
+            resolve()
+          }
+          
+          putRequest.onerror = () => {
+            triggerEvent(getDocument().body, 'htmx:historyCache', { 
+              type: 'save-error',
+              url,
+              error: putRequest.error,
+              phase: 'put-request'
+            })
+            reject(putRequest.error)
           }
         }
 
-        // Store the new item
-        store.put(newHistoryItem)
-      }
+        getAllRequest.onerror = () => {
+          triggerEvent(getDocument().body, 'htmx:historyCache', { 
+            type: 'save-error',
+            url,
+            error: getAllRequest.error,
+            phase: 'get-all-request'
+          })
+          reject(getAllRequest.error)
+        }
+
+        tx.oncomplete = () => {
+          resolve()
+        }
+
+        tx.onerror = () => {
+          triggerEvent(getDocument().body, 'htmx:historyCache', { 
+            type: 'save-error',
+            url,
+            error: tx.error,
+            phase: 'transaction'
+          })
+          reject(tx.error)
+        }
+      })
     }).catch(e => {
+      triggerEvent(getDocument().body, 'htmx:historyCache', { 
+        type: 'save-error',
+        url,
+        error: e,
+        phase: 'database-open'
+      })
       triggerErrorEvent(getDocument().body, 'htmx:historyCacheError', { cause: e })
     })
   }
@@ -3153,19 +3206,62 @@ var htmx = (function() {
    */
   function getCachedHistory(url) {
     url = normalizePath(url)
-    
+
     return openHistoryDB()
       .then(db => {
+        triggerEvent(getDocument().body, 'htmx:historyCache', { type: 'get-started', url })
+        
         return new Promise((resolve, reject) => {
           const tx = db.transaction('history', 'readonly')
           const store = tx.objectStore('history')
           const request = store.get(url)
           
-          request.onsuccess = () => resolve(request.result || null)
-          request.onerror = () => reject(request.error)
+          request.onsuccess = () => {
+            const result = request.result || null
+            triggerEvent(getDocument().body, 'htmx:historyCache', { 
+              type: 'get-success', 
+              url,
+              found: !!result,
+              item: result 
+            })
+            resolve(result)
+          }
+          
+          request.onerror = () => {
+            triggerEvent(getDocument().body, 'htmx:historyCache', { 
+              type: 'get-error',
+              url,
+              error: request.error,
+              phase: 'get-request'
+            })
+            reject(request.error)
+          }
+
+          tx.oncomplete = () => {
+            resolve(request.result || null)
+          }
+
+          tx.onerror = () => {
+            triggerEvent(getDocument().body, 'htmx:historyCache', { 
+              type: 'get-error',
+              url,
+              error: tx.error,
+              phase: 'transaction'
+            })
+            reject(tx.error)
+          }
         })
       })
-      .catch(() => null)
+      .catch(e => {
+        triggerEvent(getDocument().body, 'htmx:historyCache', { 
+          type: 'get-error',
+          url,
+          error: e,
+          phase: 'database-open'
+        })
+        triggerErrorEvent(getDocument().body, 'htmx:historyCacheError', { cause: e })
+        return null
+      })
   }
 
   /**
